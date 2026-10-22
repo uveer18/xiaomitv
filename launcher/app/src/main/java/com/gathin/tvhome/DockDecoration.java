@@ -9,10 +9,10 @@ import android.view.View;
 import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.RecyclerView;
 
-/** Draws the tvOS style lighter band behind the first (dock) row and adds a gap below it. */
+/** Draws the sleek band behind the first (dock) row and adds clean spacing below it. */
 public class DockDecoration extends RecyclerView.ItemDecoration {
 
-    private final int dockSize;
+    private int dockSize;
     private final float density;
     private final Paint band = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint edge = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -21,10 +21,14 @@ public class DockDecoration extends RecyclerView.ItemDecoration {
     DockDecoration(int dockSize, float density) {
         this.dockSize = dockSize;
         this.density = density;
-        band.setColor(0xFF141416);
+        band.setColor(0xFF131418);
         edge.setStyle(Paint.Style.STROKE);
         edge.setStrokeWidth(density);
-        edge.setColor(0x1FFFFFFF);
+        edge.setColor(0x22FFFFFF);
+    }
+
+    public void setDockSize(int dockSize) {
+        this.dockSize = dockSize;
     }
 
     @Override
@@ -32,8 +36,8 @@ public class DockDecoration extends RecyclerView.ItemDecoration {
                                @NonNull RecyclerView.State state) {
         int pos = parent.getChildAdapterPosition(view);
         if (pos >= 0 && pos < dockSize) {
-            outRect.top = (int) (6 * density);
-            outRect.bottom = (int) (12 * density);
+            outRect.top = (int) (4 * density);
+            outRect.bottom = (int) (14 * density);
         }
     }
 
@@ -58,9 +62,9 @@ public class DockDecoration extends RecyclerView.ItemDecoration {
             }
         }
         if (!any) return;
-        float pad = 14 * density;
+        float pad = 8 * density;
         rect.inset(-pad, -pad);
-        float radius = 26 * density;
+        float radius = 16 * density;
         c.drawRoundRect(rect, radius, radius, band);
         c.drawRoundRect(rect, radius, radius, edge);
     }

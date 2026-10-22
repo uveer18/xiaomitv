@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Soft fade under the top bar so the clock sits on a base, not in a void. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <gradient
+        android:angle="270"
+        android:startColor="#B3070810"
+        android:centerColor="#4D070810"
+        android:endColor="#00070810"
+        android:type="linear" />
+</shape>

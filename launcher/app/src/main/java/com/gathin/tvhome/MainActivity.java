@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.drawable.ColorDrawable;
@@ -14,6 +15,7 @@ import android.media.tv.TvInputManager;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
+import android.net.Uri;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
@@ -25,6 +27,7 @@ import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.animation.AnimationUtils;
+import android.view.animation.DecelerateInterpolator;
 import android.view.animation.LayoutAnimationController;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
@@ -46,24 +49,27 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * tvOS style home: black, a pinned dock row, an app grid, and one glass highlight that springs between tiles.
+ * Fast, lightweight TV Home Launcher for low-spec smart TVs.
+ * Features:
+ * - 6 popular Indian streaming apps in Home Bar (customizable via long-press/Menu)
+ * - Curated popular content showcase shelf above the dock
+ * - Snappy, non-springy fluid animations (critically damped, zero bounce)
+ * - Modern dark OLED aesthetics with clean typography
  */
 public class MainActivity extends Activity implements AppAdapter.TileListener {
 
-    /** Tiles per row and dock slots (res/values/config.xml, columns). Set in onCreate. */
-    static int COLUMNS = 4;
+    static int COLUMNS = 6;
     private static final long MINUTE_MS = 60_000L;
     private String liveTvPkg;
 
     private AppAdapter adapter;
     private RecyclerView grid;
+    private DockDecoration dockDecoration;
     private FrameLayout root;
     private GlassView glass;
-    private View ambient;
-    private TextView heroName;
-    private GradientDrawable ambientGlow;
-    private int ambientColor;
-    private boolean heroShown;
+    private View dockStrip;
+    private GradientDrawable stripGradient;
+    private int stripColor;
     private TextView greeting;
     private TextView btnWifi;
     private SpringAnimation springX, springY;
@@ -71,6 +77,19 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private boolean glassShown;
     private int lastFocused = 0;
     private float density;
+    private SharedPreferences prefs;
+
+    // Shelf views
+    private LinearLayout shelfContainer;
+    private View shelfAccentDot;
+    private TextView shelfAppTitle;
+    private TextView shelfSubtitle;
+    private final FrameLayout[] shelfCards = new FrameLayout[4];
+    private final TextView[] shelfTags = new TextView[4];
+    private final TextView[] shelfTitles = new TextView[4];
+    private final TextView[] shelfSubs = new TextView[4];
+    private String currentShelfPkg = "";
+    private int lastFocusedDockIndex = 0;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable minuteTick = new Runnable() {
@@ -89,35 +108,37 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         density = getResources().getDisplayMetrics().density;
         COLUMNS = Math.max(1, getResources().getInteger(R.integer.columns));
         liveTvPkg = getString(R.string.live_tv_package).trim();
+        prefs = getSharedPreferences("tvhome_v2", MODE_PRIVATE);
 
         root = findViewById(R.id.root);
         glass = findViewById(R.id.glass);
-        ambient = findViewById(R.id.ambient);
-        heroName = findViewById(R.id.heroName);
-        ambientGlow = new GradientDrawable();
-        ambientGlow.setGradientType(GradientDrawable.RADIAL_GRADIENT);
-        ambientGlow.setGradientCenter(0.32f, 0.42f);
-        ambient.setBackground(ambientGlow);
-        ambient.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) ->
-                ambientGlow.setGradientRadius((r - l) * 0.62f));
+        dockStrip = findViewById(R.id.dockStrip);
+        stripGradient = new GradientDrawable();
+        stripGradient.setGradientType(GradientDrawable.LINEAR_GRADIENT);
+        stripGradient.setOrientation(GradientDrawable.Orientation.BOTTOM_TOP);
+        dockStrip.setBackground(stripGradient);
         greeting = findViewById(R.id.greeting);
         btnWifi = findViewById(R.id.btnWifi);
+
+        // Content shelf setup
+        initShelf();
 
         grid = findViewById(R.id.grid);
         grid.setLayoutManager(new GridLayoutManager(this, COLUMNS));
         grid.setHasFixedSize(true);
         grid.setItemAnimator(null);
-        grid.addItemDecoration(new DockDecoration(COLUMNS, density));
+        dockDecoration = new DockDecoration(COLUMNS, density);
+        grid.addItemDecoration(dockDecoration);
         grid.setLayoutAnimation(new LayoutAnimationController(
-                AnimationUtils.loadAnimation(this, R.anim.tile_enter), 0.06f));
-        adapter = new AppAdapter(this, this, COLUMNS);
+                AnimationUtils.loadAnimation(this, R.anim.tile_enter), 0.03f));
+        adapter = new AppAdapter(this, this, COLUMNS, prefs);
         grid.setAdapter(adapter);
 
-        // tvOS layout: push the dock row to the bottom of the screen; the grid hides below until you press Down.
+        // Push the dock row to the bottom of the screen; the grid hides below until you press Down.
         grid.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
             int h = b - t;
-            int dockRow = (int) ((145 + 6 + 12) * density);   // item height plus DockDecoration offsets
-            int want = Math.max(0, h - dockRow - (int) (30 * density));
+            int dockRow = (int) ((84 + 4 + 14) * density);
+            int want = Math.max(0, h - dockRow - (int) (16 * density));
             if (grid.getPaddingTop() != want) {
                 grid.setPadding(grid.getPaddingLeft(), want, grid.getPaddingRight(), grid.getPaddingBottom());
             }
@@ -134,36 +155,111 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             }
         });
 
-        // Liquid feel: soft springs on the highlight's position.
+        // Critically damped spring: 0.96f damping ratio + 500f stiffness = NO BOUNCE, instantaneous glide
         springX = new SpringAnimation(glass, DynamicAnimation.TRANSLATION_X);
         springY = new SpringAnimation(glass, DynamicAnimation.TRANSLATION_Y);
         for (SpringAnimation s : new SpringAnimation[]{springX, springY}) {
-            s.setSpring(new SpringForce().setStiffness(260f).setDampingRatio(0.58f));
+            s.setSpring(new SpringForce().setStiffness(500f).setDampingRatio(1.0f));
         }
 
         View btnInputs = findViewById(R.id.btnInputs);
         View btnSettings = findViewById(R.id.btnSettings);
         btnInputs.setOnClickListener(v -> showInputs());
         btnWifi.setOnClickListener(v -> open(new Intent(Settings.ACTION_WIFI_SETTINGS)));
-        btnSettings.setOnClickListener(v -> open(new Intent(Settings.ACTION_SETTINGS)));
+        btnSettings.setOnClickListener(v -> showSettingsMenu());
 
-        // Keep focus on the top bar at its ends and at the top: Android's focus finder would otherwise
-        // jump to a tile far below when there is nothing in that direction.
+        // Keep focus on the top bar at its ends and at the top
         View.OnKeyListener pillKeys = (v, keyCode, event) -> {
             if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
             if (keyCode == KeyEvent.KEYCODE_DPAD_UP) return true;
             if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT && v.getId() == R.id.btnInputs) return true;
-            return keyCode == KeyEvent.KEYCODE_DPAD_RIGHT && v.getId() == R.id.btnSettings;
+            if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT && v.getId() == R.id.btnSettings) return true;
+            if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
+                // Return to shelf cards or dock
+                if (shelfContainer.getAlpha() > 0.5f) {
+                    shelfCards[0].requestFocus();
+                } else {
+                    focusTile(lastFocused);
+                }
+                return true;
+            }
+            return false;
         };
         btnInputs.setOnKeyListener(pillKeys);
         btnWifi.setOnKeyListener(pillKeys);
         btnSettings.setOnKeyListener(pillKeys);
 
-        // Hide the glass when focus leaves the tiles.
+        // Hide the glass when focus leaves the tiles
         getWindow().getDecorView().getViewTreeObserver().addOnGlobalFocusChangeListener((oldF, newF) -> {
             boolean onTile = newF != null && newF.getId() == R.id.card;
             if (!onTile) hideGlass();
         });
+    }
+
+    private void initShelf() {
+        shelfContainer = findViewById(R.id.shelfContainer);
+        shelfAccentDot = findViewById(R.id.shelfAccentDot);
+        shelfAppTitle = findViewById(R.id.shelfAppTitle);
+        shelfSubtitle = findViewById(R.id.shelfSubtitle);
+
+        int[] cardIds = {R.id.shelfCard0, R.id.shelfCard1, R.id.shelfCard2, R.id.shelfCard3};
+        int[] tagIds = {R.id.shelfTag0, R.id.shelfTag1, R.id.shelfTag2, R.id.shelfTag3};
+        int[] titleIds = {R.id.shelfTitle0, R.id.shelfTitle1, R.id.shelfTitle2, R.id.shelfTitle3};
+        int[] subIds = {R.id.shelfSub0, R.id.shelfSub1, R.id.shelfSub2, R.id.shelfSub3};
+
+        DecelerateInterpolator cardInterp = new DecelerateInterpolator(1.4f);
+
+        for (int i = 0; i < 4; i++) {
+            final int cardIndex = i;
+            shelfCards[i] = findViewById(cardIds[i]);
+            shelfTags[i] = findViewById(tagIds[i]);
+            shelfTitles[i] = findViewById(titleIds[i]);
+            shelfSubs[i] = findViewById(subIds[i]);
+
+            // Subtle non-springy card focus animation
+            shelfCards[i].setOnFocusChangeListener((v, focused) -> {
+                float scale = focused ? 1.05f : 1.0f;
+                v.animate().scaleX(scale).scaleY(scale)
+                        .setDuration(focused ? 130 : 100)
+                        .setInterpolator(cardInterp)
+                        .start();
+
+                GradientDrawable bg = (GradientDrawable) v.getBackground().mutate();
+                if (focused) {
+                    bg.setStroke((int) (2.5f * density), stripColor != 0 ? stripColor : 0xFFFFFFFF);
+                } else {
+                    bg.setStroke((int) (1f * density), 0x26FFFFFF);
+                }
+            });
+
+            // Navigation from shelf cards
+            shelfCards[i].setOnKeyListener((v, keyCode, event) -> {
+                if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
+                if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
+                    focusTile(Math.min(cardIndex, adapter.getDockCount() - 1));
+                    return true;
+                }
+                if (keyCode == KeyEvent.KEYCODE_DPAD_UP) {
+                    findViewById(R.id.btnInputs).requestFocus();
+                    return true;
+                }
+                if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT && cardIndex == 0) {
+                    return true;
+                }
+                if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT && cardIndex == 3) {
+                    return true;
+                }
+                return false;
+            });
+
+            // Click launches the associated streaming app
+            shelfCards[i].setOnClickListener(v -> {
+                AppAdapter.Entry e = (AppAdapter.Entry) v.getTag();
+                if (e != null) {
+                    adapter.launch(e);
+                }
+            });
+        }
     }
 
     @Override
@@ -171,16 +267,16 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         super.onResume();
         glassShown = false;
         glass.setAlpha(0f);
-        heroShown = false;
-        heroName.setAlpha(0f);
-        ambient.setAlpha(0f);
+        shelfContainer.setAlpha(0f);
+        dockStrip.setAlpha(0f);
+        currentShelfPkg = "";
         adapter.reload();
+        dockDecoration.setDockSize(adapter.getDockCount());
         grid.scheduleLayoutAnimation();
         updateGreeting();
         updateWifiLabel();
         handler.postDelayed(minuteTick, MINUTE_MS);
 
-        // Return to the tile we left from, or the first one.
         grid.post(() -> {
             View focused = getCurrentFocus();
             if (focused != null && grid.findContainingViewHolder(focused) != null) return;
@@ -196,18 +292,22 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
 
     @Override
     public void onBackPressed() {
-        // Home screen: Back goes nowhere.
+        // Return focus to dock row if elsewhere
+        if (lastFocused >= adapter.getDockCount()) {
+            focusTile(0);
+        }
     }
 
-    // ---- glass highlight -------------------------------------------------------------------------
+    // ---- TileListener implementation -------------------------------------------------------------
 
     @Override
     public void onTileFocused(int position, View card) {
         lastFocused = position;
-        // Tile rect in root coordinates, using layout positions (ignores the scale animation).
+        int dockCount = adapter.getDockCount();
+
         Rect r = new Rect(0, 0, card.getWidth(), card.getHeight());
         root.offsetDescendantRectToMyCoords(card, r);
-        float pad = 6f * density;        // matches GlassView's glow inset
+        float pad = 4f * density;
         float w = card.getWidth() * AppAdapter.FOCUS_SCALE + 2 * pad;
         float h = card.getHeight() * AppAdapter.FOCUS_SCALE + 2 * pad;
         float x = r.exactCenterX() - w / 2f;
@@ -218,7 +318,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             lp.width = (int) w;
             lp.height = (int) h;
             glass.setLayoutParams(lp);
-            glass.setRadius(16f * density * AppAdapter.FOCUS_SCALE + pad);
+            glass.setRadius(12f * density * AppAdapter.FOCUS_SCALE + pad);
         }
         glassTargetX = x;
         glassTargetY = y;
@@ -227,96 +327,112 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             springY.cancel();
             glass.setTranslationX(x);
             glass.setTranslationY(y);
-            glass.animate().alpha(1f).setDuration(180).start();
+            glass.animate().alpha(1f).setDuration(120).start();
             glassShown = true;
         } else {
             springX.animateToFinalPosition(x);
             springY.animateToFinalPosition(y);
         }
+
         View item = (View) card.getParent();
-        if (position < COLUMNS) {
-            // Dock: park it at the bottom of the screen and show the top shelf for this app.
-            int decoratedTop = item.getTop() - (int) (6 * density);
+        if (position < dockCount) {
+            lastFocusedDockIndex = position;
+            int decoratedTop = item.getTop() - (int) (4 * density);
             int dy = decoratedTop - grid.getPaddingTop();
             if (Math.abs(dy) > 1) grid.smoothScrollBy(0, dy);
-            showHero(position, r.top - dy);
+            updateShelf(position);
         } else {
-            hideHero();
-            // Scroll just enough so the whole glass (not only the tile) is visible.
+            hideShelf();
             Rect want = new Rect(0, -(int) pad * 2, item.getWidth(), item.getHeight() + (int) pad);
             grid.requestChildRectangleOnScreen(item, want, false);
         }
     }
 
-    // ---- top shelf -------------------------------------------------------------------------------
-
-    private void showHero(int position, float dockTopInRoot) {
-        String label = adapter.labelAt(position);
-        int color = adapter.ambientColorAt(position);
-        float y = dockTopInRoot - 14 * density - 26 * density - heroName.getHeight();
-        boolean changed = !label.contentEquals(heroName.getText());
-
-        if (!heroShown) {
-            heroName.setText(label);
-            heroName.setY(y);
-            heroName.setTranslationX(0f);
-            heroName.animate().alpha(1f).setDuration(260).start();
-            setAmbient(color);
-            ambient.animate().alpha(1f).setDuration(600).start();
-            heroShown = true;
-        } else if (changed) {
-            heroName.animate().alpha(0f).translationX(-12 * density).setDuration(120).withEndAction(() -> {
-                heroName.setText(label);
-                heroName.setY(y);
-                heroName.setTranslationX(12 * density);
-                heroName.animate().alpha(1f).translationX(0f).setDuration(200).start();
-            }).start();
-            if (color != ambientColor) {
-                ambient.animate().alpha(0.35f).setDuration(200).withEndAction(() -> {
-                    setAmbient(color);
-                    ambient.animate().alpha(1f).setDuration(500).start();
-                }).start();
+    @Override
+    public boolean onTileVerticalKey(int position, int keyCode) {
+        int count = adapter.getItemCount();
+        int dockCount = adapter.getDockCount();
+        if (keyCode == KeyEvent.KEYCODE_DPAD_UP) {
+            if (position < dockCount) {
+                // Focus moves into the shelf cards!
+                int targetCard = Math.min(position, 3);
+                shelfCards[targetCard].requestFocus();
+                return true;
             }
+            int target = position - COLUMNS;
+            focusTile(Math.max(0, target));
+            return true;
         } else {
-            heroName.setY(y);
+            int lastRowStart = ((count - 1) / COLUMNS) * COLUMNS;
+            if (position >= lastRowStart) return true;
+            int target = Math.min(position + COLUMNS, count - 1);
+            focusTile(target);
+            return true;
         }
     }
 
-    private void setAmbient(int color) {
-        ambientColor = color;
-        int c = color & 0x00FFFFFF;
-        ambientGlow.setColors(new int[]{0x5C000000 | c, 0x26000000 | c, 0x00000000 | c});
+    @Override
+    public void onTileLongClick(int position, View card, AppAdapter.Entry entry) {
+        if (entry == null) entry = adapter.getEntry(position);
+        if (entry == null) return;
+        showCustomizePopup(position, card, entry);
     }
 
-    private void hideHero() {
-        if (!heroShown) return;
-        heroShown = false;
-        heroName.animate().alpha(0f).setDuration(160).start();
-        ambient.animate().alpha(0f).setDuration(300).start();
+    // ---- Content Shelf ---------------------------------------------------------------------------
+
+    private void updateShelf(int position) {
+        AppAdapter.Entry entry = adapter.getEntry(position);
+        if (entry == null) return;
+        if (entry.pkg.equals(currentShelfPkg) && shelfContainer.getAlpha() > 0.8f) {
+            return;
+        }
+        currentShelfPkg = entry.pkg;
+
+        List<PopularContent.Item> items = PopularContent.getItems(entry.pkg, entry.label);
+        int accent = items.get(0).accentColor;
+        setStrip(accent);
+
+        shelfContainer.animate().alpha(0.35f).setDuration(80).withEndAction(() -> {
+            shelfAppTitle.setText(entry.label);
+            shelfSubtitle.setText("• POPULAR ON " + entry.label.toUpperCase());
+
+            GradientDrawable dotBg = (GradientDrawable) shelfAccentDot.getBackground().mutate();
+            dotBg.setColor(accent);
+
+            for (int i = 0; i < 4; i++) {
+                if (i < items.size()) {
+                    PopularContent.Item it = items.get(i);
+                    shelfTags[i].setText(it.tag);
+                    shelfTitles[i].setText(it.title);
+                    shelfSubs[i].setText(it.subtitle);
+                    shelfCards[i].setTag(entry);
+                    shelfCards[i].setVisibility(View.VISIBLE);
+                } else {
+                    shelfCards[i].setVisibility(View.INVISIBLE);
+                }
+            }
+
+            shelfContainer.animate().alpha(1f).setDuration(130).start();
+            dockStrip.animate().alpha(0.5f).setDuration(200).start();
+        }).start();
+    }
+
+    private void hideShelf() {
+        currentShelfPkg = "";
+        shelfContainer.animate().alpha(0f).setDuration(110).start();
+        dockStrip.animate().alpha(0f).setDuration(150).start();
+    }
+
+    private void setStrip(int color) {
+        stripColor = color;
+        int c = color & 0x00FFFFFF;
+        stripGradient.setColors(new int[]{0x2A000000 | c, 0x0A000000 | c, 0x00000000});
     }
 
     private void hideGlass() {
         if (!glassShown) return;
         glassShown = false;
-        glass.animate().alpha(0f).setDuration(160).start();
-    }
-
-    // ---- navigation ------------------------------------------------------------------------------
-
-    @Override
-    public boolean onTileVerticalKey(int position, int keyCode) {
-        int count = adapter.getItemCount();
-        int target;
-        if (keyCode == KeyEvent.KEYCODE_DPAD_UP) {
-            if (position < COLUMNS) return false;          // dock row: let focus move to the top bar
-            target = position - COLUMNS;
-        } else {
-            int lastRowStart = ((count - 1) / COLUMNS) * COLUMNS;
-            if (position >= lastRowStart) return true;     // already on the last row: stay put
-            target = Math.min(position + COLUMNS, count - 1);
-        }
-        focusTile(target);
-        return true;
+        glass.animate().alpha(0f).setDuration(100).start();
     }
 
     private void focusTile(int position) {
@@ -327,7 +443,6 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             vh.itemView.findViewById(R.id.card).requestFocus();
             return;
         }
-        // Not laid out yet: scroll there, then focus once the scroll settles.
         grid.addOnScrollListener(new RecyclerView.OnScrollListener() {
             @Override
             public void onScrollStateChanged(@NonNull RecyclerView rv, int newState) {
@@ -341,7 +456,117 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         grid.smoothScrollToPosition(pos);
     }
 
-    // ---- top bar ---------------------------------------------------------------------------------
+    // ---- Customization & Settings ----------------------------------------------------------------
+
+    private void showCustomizePopup(int position, View anchor, AppAdapter.Entry entry) {
+        View panel = getLayoutInflater().inflate(R.layout.popup_inputs, root, false);
+        LinearLayout rows = panel.findViewById(R.id.rows);
+
+        int width = (int) (230 * density);
+        final PopupWindow popup = new PopupWindow(panel, width, ViewGroup.LayoutParams.WRAP_CONTENT, true);
+        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        popup.setOutsideTouchable(true);
+        popup.setAnimationStyle(0);
+
+        boolean isDocked = adapter.isDocked(entry.pkg);
+        int dockCount = adapter.getDockCount();
+
+        // Header with App name
+        TextView header = new TextView(this);
+        header.setText(entry.label + (isDocked ? " (In Home Bar)" : ""));
+        header.setTextColor(0xFFFFFFFF);
+        header.setTextSize(14f);
+        header.setPadding((int) (12 * density), (int) (8 * density), (int) (12 * density), (int) (6 * density));
+        header.setTypeface(header.getTypeface(), android.graphics.Typeface.BOLD);
+        rows.addView(header);
+        addSeparator(rows);
+
+        if (isDocked) {
+            if (position > 0) {
+                addMenuOption(rows, popup, "◀ Move Left in Home Bar", () -> {
+                    adapter.moveDock(position, position - 1);
+                    focusTile(position - 1);
+                });
+            }
+            if (position < dockCount - 1) {
+                addMenuOption(rows, popup, "▶ Move Right in Home Bar", () -> {
+                    adapter.moveDock(position, position + 1);
+                    focusTile(position + 1);
+                });
+            }
+            addMenuOption(rows, popup, "✖ Remove from Home Bar", () -> {
+                adapter.removeFromDock(entry.pkg);
+                dockDecoration.setDockSize(adapter.getDockCount());
+                Toast.makeText(MainActivity.this, "Removed " + entry.label + " from Home Bar", Toast.LENGTH_SHORT).show();
+            });
+        } else {
+            addMenuOption(rows, popup, "★ Add to Home Bar", () -> {
+                adapter.addToDock(entry.pkg);
+                dockDecoration.setDockSize(adapter.getDockCount());
+                Toast.makeText(MainActivity.this, "Pinned " + entry.label + " to Home Bar", Toast.LENGTH_SHORT).show();
+                focusTile(adapter.getDockCount() - 1);
+            });
+        }
+
+        addSeparator(rows);
+        addMenuOption(rows, popup, "⚙ App Settings / Info", () -> {
+            Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + entry.pkg));
+            open(i);
+        });
+
+        panel.setAlpha(0f);
+        panel.setScaleY(0.95f);
+        popup.showAtLocation(anchor, Gravity.CENTER, 0, 0);
+        panel.animate().alpha(1f).scaleY(1f).setDuration(140).start();
+        rows.getChildAt(2).requestFocus(); // focus first actionable item
+    }
+
+    private void showSettingsMenu() {
+        View anchor = findViewById(R.id.btnSettings);
+        View panel = getLayoutInflater().inflate(R.layout.popup_inputs, root, false);
+        LinearLayout rows = panel.findViewById(R.id.rows);
+
+        int width = (int) (220 * density);
+        final PopupWindow popup = new PopupWindow(panel, width, ViewGroup.LayoutParams.WRAP_CONTENT, true);
+        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        popup.setOutsideTouchable(true);
+        popup.setAnimationStyle(0);
+
+        addMenuOption(rows, popup, "⚙ All TV Settings", () -> open(new Intent(Settings.ACTION_SETTINGS)));
+        addMenuOption(rows, popup, "📶 Wi-Fi Settings", () -> open(new Intent(Settings.ACTION_WIFI_SETTINGS)));
+        addSeparator(rows);
+        addMenuOption(rows, popup, "↺ Reset Home Bar (Top 6 Indian Apps)", () -> {
+            adapter.resetDock();
+            dockDecoration.setDockSize(adapter.getDockCount());
+            Toast.makeText(MainActivity.this, "Home Bar reset to top Indian streaming apps", Toast.LENGTH_SHORT).show();
+            focusTile(0);
+        });
+
+        panel.setAlpha(0f);
+        panel.setScaleY(0.95f);
+        panel.setTranslationY(-4 * density);
+        popup.showAsDropDown(anchor, -(int) (50 * density), (int) (8 * density), Gravity.START);
+        panel.animate().alpha(1f).scaleY(1f).translationY(0f).setDuration(140).start();
+        rows.getChildAt(0).requestFocus();
+    }
+
+    private void addMenuOption(LinearLayout rows, PopupWindow popup, String title, Runnable action) {
+        TextView tv = new TextView(this);
+        tv.setText(title);
+        tv.setTextColor(getResources().getColorStateList(R.drawable.pill_text));
+        tv.setTextSize(13f);
+        tv.setPadding((int) (14 * density), (int) (10 * density), (int) (14 * density), (int) (10 * density));
+        tv.setBackgroundResource(R.drawable.input_row_bg);
+        tv.setFocusable(true);
+        tv.setClickable(true);
+        tv.setOnClickListener(v -> {
+            popup.dismiss();
+            action.run();
+        });
+        rows.addView(tv);
+    }
+
+    // ---- Top bar & Inputs -------------------------------------------------------------------------
 
     private void updateGreeting() {
         int hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
@@ -354,7 +579,6 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         greeting.setText(res);
     }
 
-    /** Shows the Wi-Fi network name on the button when we can read it, otherwise the connection type. */
     private void updateWifiLabel() {
         String text = getString(R.string.wifi);
         try {
@@ -388,25 +612,21 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         }
     }
 
-    /** Dropdown menu under the Inputs pill: HDMI ports (with connection state), AV and Live TV. */
     private void showInputs() {
         View anchor = findViewById(R.id.btnInputs);
         View panel = getLayoutInflater().inflate(R.layout.popup_inputs, root, false);
         LinearLayout rows = panel.findViewById(R.id.rows);
 
-        // Compact: as wide as the Inputs pill (a touch wider so "HDMI 1" fits), hanging right below it.
         int width = Math.max(anchor.getWidth(), (int) (150 * density));
         final PopupWindow popup = new PopupWindow(panel, width, ViewGroup.LayoutParams.WRAP_CONTENT, true);
-        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));   // needed for Back to dismiss
+        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
         popup.setOutsideTouchable(true);
         popup.setAnimationStyle(0);
-        popup.setElevation(0f);
 
         TvInputManager tim = (TvInputManager) getSystemService(TV_INPUT_SERVICE);
         boolean sawNonHdmi = false;
         if (tim != null) {
             List<TvInputInfo> inputs = new ArrayList<>(tim.getTvInputList());
-            // HDMI ports first in port order, then AV and the rest.
             Collections.sort(inputs, (a, b) -> {
                 boolean ha = a.getType() == TvInputInfo.TYPE_HDMI, hb = b.getType() == TvInputInfo.TYPE_HDMI;
                 if (ha != hb) return ha ? -1 : 1;
@@ -437,22 +657,19 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             return;
         }
 
-        // Drop in: fade and unfold from the top edge.
         panel.setAlpha(0f);
-        panel.setPivotY(0f);
-        panel.setScaleY(0.92f);
-        panel.setTranslationY(-8 * density);
-        popup.showAsDropDown(anchor, 0, (int) (10 * density), Gravity.START);
-        panel.animate().alpha(1f).scaleY(1f).translationY(0f).setDuration(220)
-                .setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f)).start();
+        panel.setScaleY(0.95f);
+        panel.setTranslationY(-4 * density);
+        popup.showAsDropDown(anchor, 0, (int) (8 * density), Gravity.START);
+        panel.animate().alpha(1f).scaleY(1f).translationY(0f).setDuration(140).start();
         rows.getChildAt(0).requestFocus();
     }
 
     private void addSeparator(LinearLayout rows) {
         View line = new View(this);
-        line.setBackgroundColor(0x1FFFFFFF);
+        line.setBackgroundColor(0x1AFFFFFF);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (int) density);
-        int m = (int) (6 * density), h = (int) (12 * density);
+        int m = (int) (4 * density), h = (int) (10 * density);
         lp.setMargins(h, m, h, m);
         rows.addView(line, lp);
     }
@@ -463,8 +680,6 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         ((TextView) row.findViewById(R.id.title)).setText(title);
         TextView status = row.findViewById(R.id.status);
         View dot = row.findViewById(R.id.dot);
-        // This TV reports "standby" for every port whether or not something is plugged in, so only
-        // definite states are shown.
         if (state == TvInputManager.INPUT_STATE_CONNECTED) {
             status.setText(R.string.connected);
             dot.setVisibility(View.VISIBLE);
