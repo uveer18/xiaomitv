@@ -36,8 +36,12 @@ import java.util.Set;
 /**
  * App tiles with customizable dock pinning.
  * Pinned apps are stored in SharedPreferences and appear first in the home bar.
+ *
+ * The home bar always owns a full row of the grid: when fewer apps are pinned than the grid has
+ * columns, an invisible spacer item fills the rest of the row so the rest of the apps never
+ * creep into the home bar.
  */
-public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
 
     public interface TileListener {
         void onTileFocused(int position, View card);
@@ -63,20 +67,29 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
     }
 
     public static final float FOCUS_SCALE = 1.06f;
+    /** Corner radius of an app tile, in dp. The glass highlight mirrors it exactly. */
+    public static final float CARD_RADIUS_DP = 16f;
+
+    private static final int TYPE_APP = 0;
+    private static final int TYPE_SPACER = 1;
 
     private final Context ctx;
     private final TileListener listener;
     private final int columns;
+    private final int maxDock;
     private final SharedPreferences prefs;
     private final List<String> defaultDock;
     private final List<String> dockList = new ArrayList<>();
     private final Set<String> hidden;
     private final List<Entry> items = new ArrayList<>();
+    /** How many pinned apps are actually installed, i.e. how wide the home bar is. */
+    private int dockCount;
 
     public AppAdapter(Context ctx, TileListener listener, int columns, SharedPreferences prefs) {
         this.ctx = ctx;
         this.listener = listener;
         this.columns = columns;
+        this.maxDock = Math.max(1, ctx.getResources().getInteger(R.integer.max_dock));
         this.prefs = prefs;
         this.defaultDock = Arrays.asList(ctx.getResources().getStringArray(R.array.dock_apps));
         this.hidden = new HashSet<>(Arrays.asList(ctx.getResources().getStringArray(R.array.hidden_apps)));
@@ -85,6 +98,7 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
 
     private void loadDockList() {
         dockList.clear();
+        boolean truncated = false;
         String saved = prefs.getString("dock_packages_v2", null);
         if (saved != null && !saved.trim().isEmpty()) {
             String[] parts = saved.split(",");
@@ -93,11 +107,19 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
                 if (!pkg.isEmpty() && !dockList.contains(pkg)) {
                     dockList.add(pkg);
                 }
+                if (dockList.size() >= maxDock) {
+                    truncated = parts.length > maxDock;
+                    break;
+                }
             }
         }
         if (dockList.isEmpty()) {
-            dockList.addAll(defaultDock);
+            for (String pkg : defaultDock) {
+                if (!dockList.contains(pkg)) dockList.add(pkg);
+                if (dockList.size() >= maxDock) break;
+            }
         }
+        if (truncated) saveDockList();
     }
 
     private void saveDockList() {
@@ -114,15 +136,19 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
     }
 
     public int getDockCount() {
-        return dockList.size();
+        return dockCount;
     }
 
-    public void addToDock(String pkg) {
-        if (!dockList.contains(pkg)) {
-            dockList.add(pkg);
-            saveDockList();
-            reload();
-        }
+    public int getMaxDock() {
+        return maxDock;
+    }
+
+    public boolean addToDock(String pkg) {
+        if (dockList.contains(pkg) || dockList.size() >= maxDock) return false;
+        dockList.add(pkg);
+        saveDockList();
+        reload();
+        return true;
     }
 
     public void removeFromDock(String pkg) {
@@ -146,8 +172,34 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
         reload();
     }
 
+    /** Index into the app list for an adapter position, or -1 for the row spacer. */
+    private int itemIndex(int position) {
+        if (hasSpacer()) {
+            if (position == dockCount) return -1;
+            if (position > dockCount) return position - 1;
+        }
+        return position;
+    }
+
+    /** True when the home bar does not fill the row and needs an invisible filler. */
+    private boolean hasSpacer() {
+        return dockCount > 0 && dockCount < columns;
+    }
+
+    /** Span for the grid: the filler takes whatever is left of the home bar row. */
+    public int getSpanSize(int position) {
+        if (hasSpacer() && position == dockCount) return Math.max(1, columns - dockCount);
+        return 1;
+    }
+
+    /** Adapter position of the first app that is not in the home bar. */
+    public int getFirstAppPosition() {
+        return dockCount + (hasSpacer() ? 1 : 0);
+    }
+
     public Entry getEntry(int position) {
-        return (position >= 0 && position < items.size()) ? items.get(position) : null;
+        int idx = itemIndex(position);
+        return (idx >= 0 && idx < items.size()) ? items.get(idx) : null;
     }
 
     public void reload() {
@@ -176,22 +228,34 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
         });
         items.clear();
         items.addAll(fresh);
+
+        // Only installed apps take a slot in the home bar.
+        dockCount = 0;
+        for (Entry e : items) {
+            if (dockList.contains(e.pkg)) dockCount++;
+            else break;
+        }
         notifyDataSetChanged();
     }
 
     @NonNull
     @Override
-    public Holder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
-        View v = LayoutInflater.from(parent.getContext()).inflate(R.layout.item_app, parent, false);
-        return new Holder(v, listener);
+    public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+        LayoutInflater inflater = LayoutInflater.from(parent.getContext());
+        if (viewType == TYPE_SPACER) {
+            return new SpacerHolder(inflater.inflate(R.layout.item_spacer, parent, false));
+        }
+        return new Holder(inflater.inflate(R.layout.item_app, parent, false), listener);
     }
 
     @Override
-    public void onBindViewHolder(@NonNull Holder h, int position) {
-        Entry e = items.get(position);
-        int dockCount = dockList.size();
+    public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int position) {
+        if (holder instanceof SpacerHolder) return;
+        Holder h = (Holder) holder;
+        Entry e = items.get(itemIndex(position));
+        int dock = dockCount;
         h.name.setText(e.label);
-        h.name.setVisibility(position < dockCount ? View.INVISIBLE : View.VISIBLE);
+        h.name.setVisibility(position < dock ? View.INVISIBLE : View.VISIBLE);
         h.name.setAlpha(0f);
         h.card.setScaleX(1f);
         h.card.setScaleY(1f);
@@ -218,6 +282,11 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
         });
     }
 
+    @Override
+    public int getItemViewType(int position) {
+        return (hasSpacer() && position == dockCount) ? TYPE_SPACER : TYPE_APP;
+    }
+
     public void launch(Entry e) {
         Intent i = new Intent(Intent.ACTION_MAIN)
                 .addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)
@@ -232,16 +301,17 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
 
     @Override
     public int getItemCount() {
-        return items.size();
+        return items.size() + (hasSpacer() ? 1 : 0);
     }
 
     public String labelAt(int position) {
-        return position >= 0 && position < items.size() ? items.get(position).label : "";
+        Entry e = getEntry(position);
+        return e != null ? e.label : "";
     }
 
     public int ambientColorAt(int position) {
-        if (position < 0 || position >= items.size()) return 0xFF333338;
-        Entry e = items.get(position);
+        Entry e = getEntry(position);
+        if (e == null) return 0xFF333338;
         if (e.ambient == 0) e.ambient = vividColor(e.banner != null ? e.banner : e.icon);
         return e.ambient;
     }
@@ -287,6 +357,12 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
         return Color.HSVToColor(hsv);
     }
 
+    static final class SpacerHolder extends RecyclerView.ViewHolder {
+        SpacerHolder(View v) {
+            super(v);
+        }
+    }
+
     static final class Holder extends RecyclerView.ViewHolder {
         final View card;
         final ImageView banner;
@@ -303,7 +379,7 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
             name = v.findViewById(R.id.name);
 
             final float density = v.getResources().getDisplayMetrics().density;
-            final float radius = density * 12f;
+            final float radius = density * CARD_RADIUS_DP;
             card.setOutlineProvider(new ViewOutlineProvider() {
                 @Override
                 public void getOutline(View view, Outline outline) {
